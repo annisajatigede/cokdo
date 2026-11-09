@@ -8,7 +8,7 @@ import {
   updateProfile,
   User 
 } from 'firebase/auth';
-import { ref, update, onValue, push } from 'firebase/database';
+import { ref, update, onValue, push, get } from 'firebase/database';
 import { auth, rtdb } from '@/lib/firebase';
 import { 
   Card, 
@@ -68,7 +68,7 @@ function RoomContent() {
   const [unreadChatCount, setUnreadChatCount] = useState<number>(0);
   const chatScrollRef = useRef<HTMLDivElement>(null);
 
-  // 1. Auth Listener & Custom Player Name
+  // 1. Auth Listener & Inisialisasi Meja & Host
   useEffect(() => {
     const savedName = localStorage.getItem('cokdo_player_name');
 
@@ -93,7 +93,21 @@ function RoomContent() {
 
       setCurrentUser(activeUser);
 
-      // Sinkronkan nama dan status ke RTDB
+      // Cek apakah meja sudah ada metadatanya. Jika belum, jadikan pemain pertama sebagai Host.
+      const roomMetaRef = ref(rtdb, `rooms/${roomId}/meta`);
+      const roomMetaSnap = await get(roomMetaRef);
+      if (!roomMetaSnap.exists()) {
+        await update(roomMetaRef, {
+          hostId: activeUser.uid,
+          createdAt: Date.now(),
+          status: 'WAITING',
+          roundNumber: 1,
+          turnTimeoutMs: 30000,
+          isPrivate: true
+        });
+      }
+
+      // Daftarkan pemain ke meja
       const playerRef = ref(rtdb, `rooms/${roomId}/players/${activeUser.uid}`);
       await update(playerRef, {
         name: initialName,
@@ -106,7 +120,7 @@ function RoomContent() {
     return () => unsubscribe();
   }, [roomId]);
 
-  // 2. Room State Listener
+  // 2. Realtime Room State Listener
   useEffect(() => {
     if (!roomId) return;
     const roomRef = ref(rtdb, `rooms/${roomId}`);
@@ -182,19 +196,45 @@ function RoomContent() {
   };
 
   const playersList = roomData?.players ? Object.entries<any>(roomData.players) : [];
-  const isHost = currentUser && roomData?.meta?.hostId === currentUser.uid;
+  const playerIds = playersList.map(([id]) => id);
+  const isHost = currentUser && (roomData?.meta?.hostId === currentUser.uid || playerIds[0] === currentUser.uid);
   const currentTurnPlayerId = roomData?.game?.currentTurnPlayerId;
   const isMyTurn = currentUser && currentTurnPlayerId === currentUser.uid;
   const currentTurnPlayer = playersList.find(([id]) => id === currentTurnPlayerId)?.[1];
   const activeWildRank = roomData?.game?.activeWildRank || 2;
   const wildCard = roomData?.game?.wildIndicatorCard;
   const lastDiscard = roomData?.game?.discardHistory?.lastDiscard;
+  const isGamePlaying = roomData?.meta?.status === 'PLAYING';
 
-  // Aksi: Mulai Permainan
+  // ATURAN GILIRAN PERTAMA (RONDE 1 = HOST, RONDE SELANJUTNYA = SKOR TERTINGGI)
+  const determineFirstPlayerId = () => {
+    const roundNumber = roomData?.meta?.roundNumber || 1;
+    if (roundNumber === 1 || !roomData?.tableLeaderboard?.scores) {
+      // Ronde 1: Pembuat meja (Host) mulai pertama
+      return roomData?.meta?.hostId || playerIds[0];
+    } else {
+      // Ronde > 1: Pemain dengan skor tertinggi yang mulai pertama!
+      const scores = roomData.tableLeaderboard.scores;
+      let highestScore = -Infinity;
+      let highestPlayerId = playerIds[0];
+
+      playerIds.forEach((id) => {
+        const sc = scores[id] ?? 0;
+        if (sc > highestScore) {
+          highestScore = sc;
+          highestPlayerId = id;
+        }
+      });
+      return highestPlayerId;
+    }
+  };
+
+  // Aksi: Mulai Permainan (Ronde Baru)
   const handleStartGame = async () => {
-    if (!playersList.length || !isHost) return;
-    const playerIds = playersList.map(([id]) => id);
+    if (!playerIds.length) return;
     const deal = dealGame(playerIds);
+    const starterId = determineFirstPlayerId();
+    const starterName = roomData?.players?.[starterId]?.name || 'Pemain';
 
     const updates: Record<string, any> = {
       'meta/status': 'PLAYING',
@@ -203,7 +243,7 @@ function RoomContent() {
       'game/drawDeck': deal.drawDeck,
       'game/drawDeckCount': deal.drawDeck.length,
       'game/hands': deal.playerHands,
-      'game/currentTurnPlayerId': deal.firstPlayerId,
+      'game/currentTurnPlayerId': starterId,
       'game/turnDeadline': Date.now() + 30000,
       'game/discardHistory/lastDiscard': null,
       'game/discardHistory/recentDiscards': []
@@ -217,8 +257,7 @@ function RoomContent() {
     setHasDrawnThisTurn(false);
     setSelectedCardIds([]);
 
-    // Notifikasi sistem di chat
-    handleSendChat(undefined, `🎮 Permainan Dimulai! Giliran pertama: ${roomData.players[deal.firstPlayerId]?.name || 'Pemain'}`);
+    handleSendChat(undefined, `🎮 Ronde Dimulai! Kartu Sakti: Rank ${getRankLabel(deal.activeWildRank)}. Giliran pertama: ${starterName}!`);
   };
 
   // Aksi: Ambil Kartu Dek
@@ -266,7 +305,6 @@ function RoomContent() {
 
     const updatedHand = myHand.filter(c => c.id !== discardCardId);
 
-    const playerIds = playersList.map(([id]) => id);
     const currentIndex = playerIds.indexOf(currentUser?.uid || '');
     const nextPlayerId = playerIds[(currentIndex + 1) % playerIds.length];
 
@@ -293,7 +331,7 @@ function RoomContent() {
     setLastDrawnSource(null);
   };
 
-  // Aksi: Tutup Rummy & Sanksi Kena Umpan
+  // AKSI: TUTUP / RUMMY & LOGIKA SANKSI UMPAN + KAPEUNCIT
   const handleDeclareWin = async () => {
     if (!isMyTurn || selectedCardIds.length !== 1) {
       alert('Pilih 1 kartu penutup untuk dibuang ke tombol TUTUP!');
@@ -307,8 +345,27 @@ function RoomContent() {
     const winnerId = currentUser?.uid || '';
     const bonus = calculateClosingBonus(closingCard, activeWildRank);
     const scores = { ...(roomData.tableLeaderboard?.scores || {}) };
-    let penalizedPlayerId: string | null = null;
 
+    playerIds.forEach(id => {
+      if (scores[id] === undefined) scores[id] = 0;
+    });
+
+    // 1. Catat siapa pemegang skor tertinggi sebelum ronde ini selesai
+    let previousLeaderId: string | null = null;
+    let previousLeaderScore = -Infinity;
+    playerIds.forEach(id => {
+      const s = scores[id] || 0;
+      if (s > previousLeaderScore) {
+        previousLeaderScore = s;
+        previousLeaderId = id;
+      }
+    });
+
+    // 2. Tambah skor pemenang
+    scores[winnerId] = (scores[winnerId] || 0) + bonus;
+
+    // 3. Sanksi Umpan / Tembak
+    let penalizedPlayerId: string | null = null;
     if (lastDrawnSource === 'discard' && lastDiscard) {
       const feederId = lastDiscard.discardedBy;
       if (feederId && feederId !== winnerId) {
@@ -317,34 +374,66 @@ function RoomContent() {
       }
     }
 
-    scores[winnerId] = (scores[winnerId] || 0) + bonus;
-
-    playersList.forEach(([pid]) => {
+    // Pemain pasif
+    playerIds.forEach(pid => {
       if (pid !== winnerId && pid !== penalizedPlayerId) {
         scores[pid] = (scores[pid] || 0) - 25;
       }
     });
 
+    // 4. LOGIKA KAPEUNCIT:
+    // Cek apakah ada pemain baru yang melampaui rekor skor tertinggi sebelumnya!
+    let kapeuncitPlayerId: string | null = null;
+    let newLeaderId = winnerId;
+    let newLeaderScore = -Infinity;
+
+    playerIds.forEach(id => {
+      const s = scores[id];
+      if (s > newLeaderScore) {
+        newLeaderScore = s;
+        newLeaderId = id;
+      }
+    });
+
+    // Jika pemegang rekor sebelumnya disusul/dilampaui oleh pemain lain:
+    if (previousLeaderId && previousLeaderId !== newLeaderId && newLeaderScore > previousLeaderScore) {
+      kapeuncitPlayerId = previousLeaderId;
+      scores[previousLeaderId] = 0; // HANGUS / RESET KE 0!
+    }
+
+    const currentRound = roomData?.meta?.roundNumber || 1;
+    const previousLeaderName = roomData?.players?.[kapeuncitPlayerId || '']?.name || 'Pemain';
+    const newLeaderName = roomData?.players?.[newLeaderId]?.name || 'Pemain';
+
     await update(ref(rtdb, `rooms/${roomId}`), {
       'meta/status': 'ROUND_END',
+      'meta/roundNumber': currentRound + 1,
       'tableLeaderboard/scores': scores,
       'meta/lastRoundResult': {
         winnerId,
         winnerName: playerName,
         penalizedPlayerId,
+        kapeuncitPlayerId,
+        previousLeaderName: kapeuncitPlayerId ? previousLeaderName : null,
+        newLeaderName,
         closingCard,
         bonus,
         wasFromDiscard: lastDrawnSource === 'discard'
       }
     });
 
-    const feederName = roomData.players[penalizedPlayerId || '']?.name || 'Lawan';
-    handleSendChat(
-      undefined, 
-      penalizedPlayerId 
-        ? `🏆 ${playerName} TUTUP RUMMY! 💥 ${feederName} KENA UMPAN (-${bonus} Poin)!`
-        : `🏆 ${playerName} TUTUP RUMMY! (+${bonus} Poin)`
-    );
+    // Siarkan kabar ke obrolan
+    if (kapeuncitPlayerId) {
+      handleSendChat(
+        undefined, 
+        `🚨 KAPEUNCIT! Skor ${previousLeaderName} tersusul oleh ${newLeaderName} (${newLeaderScore}) sehingga di-reset kembali ke 0! Giliran ronde depan diambil oleh ${newLeaderName}.`
+      );
+    } else {
+      handleSendChat(
+        undefined, 
+        `🏆 ${playerName} TUTUP RUMMY! (+${bonus} Poin)`
+      );
+    }
   };
 
   const handleCheckMeld = () => {
@@ -432,7 +521,7 @@ function RoomContent() {
         <main className="flex-1 relative flex flex-col items-center justify-between p-4 bg-radial from-emerald-950/60 via-zinc-950 to-zinc-950">
           
           {/* BANNER GILIRAN JELAS */}
-          {roomData?.meta?.status === 'PLAYING' && (
+          {isGamePlaying ? (
             <div className={`px-5 py-2 rounded-full border text-sm font-black tracking-wide flex items-center gap-2 shadow-xl backdrop-blur ${
               isMyTurn 
                 ? 'bg-amber-400 text-zinc-950 border-amber-300 ring-4 ring-amber-400/30 animate-pulse' 
@@ -445,17 +534,22 @@ function RoomContent() {
                   : `Sedang Giliran: ${currentTurnPlayer?.name || 'Pemain Lawan'}`}
               </span>
             </div>
+          ) : (
+            <div className="px-5 py-1.5 rounded-full border border-zinc-800 bg-zinc-900/70 text-xs text-zinc-400">
+              Meja Siap ({playersList.length} Pemain Bergabung)
+            </div>
           )}
 
           {/* Kursi Lawan (Top Row) */}
           <div className="w-full max-w-4xl flex items-center justify-around px-4 pt-1">
             {playersList.filter(([id]) => id !== currentUser?.uid).map(([id, p]) => {
               const isHisTurn = currentTurnPlayerId === id;
+              const sc = roomData?.tableLeaderboard?.scores?.[id] || 0;
               return (
                 <div 
                   key={id} 
                   className={`flex flex-col items-center p-3 rounded-2xl border transition-all duration-200 ${
-                    isHisTurn 
+                    isHisTurn && isGamePlaying
                       ? 'bg-amber-500/25 border-amber-400 ring-4 ring-amber-400/40 scale-105 shadow-xl' 
                       : 'bg-zinc-900/60 border-zinc-800'
                   }`}
@@ -467,12 +561,12 @@ function RoomContent() {
                     {p.name}
                   </span>
                   <span className="text-[10px] text-zinc-400 font-mono">
-                    {roomData?.meta?.status === 'PLAYING' ? `🂠 ${p.handCount || 7} Kartu` : 'Siap'}
+                    {isGamePlaying ? `🂠 ${p.handCount || 7} Kartu` : 'Siap'}
                   </span>
                   <span className={`text-[10px] font-black font-mono ${
-                    (roomData?.tableLeaderboard?.scores?.[id] || 0) < 0 ? 'text-rose-400' : 'text-emerald-400'
+                    sc < 0 ? 'text-rose-400' : 'text-emerald-400'
                   }`}>
-                    Skor: {roomData?.tableLeaderboard?.scores?.[id] || 0}
+                    Skor: {sc}
                   </span>
                 </div>
               );
@@ -511,9 +605,9 @@ function RoomContent() {
               </span>
               <button
                 onClick={handleDrawCard}
-                disabled={!isMyTurn || hasDrawnThisTurn || roomData?.meta?.status !== 'PLAYING'}
+                disabled={!isMyTurn || hasDrawnThisTurn || !isGamePlaying}
                 className={`w-18 h-26 rounded-xl border-2 flex flex-col items-center justify-center font-bold text-xs transition ${
-                  isMyTurn && !hasDrawnThisTurn && roomData?.meta?.status === 'PLAYING'
+                  isMyTurn && !hasDrawnThisTurn && isGamePlaying
                     ? 'bg-emerald-600 hover:bg-emerald-500 border-white text-white shadow-lg shadow-emerald-500/40 cursor-pointer active:scale-95'
                     : 'bg-zinc-800 border-zinc-700 text-zinc-500 cursor-not-allowed opacity-60'
                 }`}
@@ -553,61 +647,68 @@ function RoomContent() {
             </div>
           </div>
 
-          {/* Modal Ruang Tunggu */}
-          {roomData?.meta?.status === 'WAITING' && (
-            <div className="bg-zinc-900/90 border border-zinc-700 rounded-2xl p-6 text-center max-w-md shadow-2xl backdrop-blur">
-              <h3 className="text-lg font-bold text-white mb-2">Ruang Tunggu Meja</h3>
+          {/* KOTAK STATUS & TOMBOL MULAI PERMAINAN (SELALU MUNCUL SAAT PERMAINAN BELUM BERJALAN) */}
+          {!isGamePlaying && roomData?.meta?.status !== 'ROUND_END' && (
+            <div className="bg-zinc-900/95 border-2 border-emerald-500/40 rounded-2xl p-6 text-center max-w-md shadow-2xl backdrop-blur">
+              <h3 className="text-lg font-black text-white mb-1">Ruang Tunggu Meja</h3>
               <p className="text-xs text-zinc-400 mb-4">
                 {playersList.length < 2 
-                  ? 'Minimal 2 pemain (maksimal 4) untuk dapat memulai permainan.' 
-                  : `${playersList.length} pemain sudah siap di meja!`}
+                  ? 'Ajak teman masuk meja (minimal 2 pemain, maksimal 4).' 
+                  : `${playersList.length} pemain sudah kumpul di meja!`}
               </p>
-              {isHost ? (
-                <button
-                  onClick={handleStartGame}
-                  className="w-full rounded-xl bg-emerald-500 py-3 font-bold text-zinc-950 hover:bg-emerald-400 active:scale-95 transition shadow-lg shadow-emerald-500/30"
-                >
-                  🎮 Mulai Permainan Sekarang!
-                </button>
-              ) : (
-                <div className="text-xs text-emerald-400 animate-pulse font-medium">
-                  Menunggu Host ({roomData?.players?.[roomData?.meta?.hostId]?.name || 'Tuan Rumah'}) memulai...
-                </div>
-              )}
+
+              {/* Siapapun atau Host bisa klik mulai jika pemain >= 2 */}
+              <button
+                onClick={handleStartGame}
+                disabled={playersList.length < 2}
+                className="w-full rounded-xl bg-emerald-500 py-3.5 font-black text-zinc-950 hover:bg-emerald-400 active:scale-95 transition shadow-lg shadow-emerald-500/30 disabled:opacity-50"
+              >
+                🎮 Mulai Permainan Sekarang!
+              </button>
             </div>
           )}
 
-          {/* Modal Ronde Selesai */}
+          {/* Modal Ronde Selesai & Pengumuman Kapeuncit */}
           {roomData?.meta?.status === 'ROUND_END' && (
             <div className="bg-zinc-900/95 border-2 border-amber-400 rounded-2xl p-6 text-center max-w-lg shadow-2xl backdrop-blur z-30">
               <h2 className="text-2xl font-black text-amber-400 mb-1">🎉 RONDE SELESAI! 🎉</h2>
-              <p className="text-sm text-zinc-200 font-semibold mb-3">
+              <p className="text-sm text-zinc-200 font-semibold mb-2">
                 Pemenang: <span className="text-emerald-400">{roomData?.meta?.lastRoundResult?.winnerName}</span> 
                 {' '}(+{roomData?.meta?.lastRoundResult?.bonus} Poin)
               </p>
               
+              {/* Notifikasi Kena Umpan */}
               {roomData?.meta?.lastRoundResult?.wasFromDiscard && (
-                <div className="bg-red-950/60 border border-red-500/40 rounded-xl p-3 mb-4 text-xs text-red-200">
+                <div className="bg-red-950/60 border border-red-500/40 rounded-xl p-2.5 mb-3 text-xs text-red-200">
                   ⚠️ <strong className="text-red-400">SANKSI KENA UMPAN AKTIF!</strong><br />
                   {roomData?.players?.[roomData?.meta?.lastRoundResult?.penalizedPlayerId]?.name || 'Pengumpan'}{' '}
-                  terkena sanksi pemotongan instan -{roomData?.meta?.lastRoundResult?.bonus} Poin karena memberi kartu penutup!
+                  dipotong -{roomData?.meta?.lastRoundResult?.bonus} Poin karena memberi umpan kartu penutup!
                 </div>
               )}
 
-              {isHost && (
-                <button
-                  onClick={handleStartGame}
-                  className="w-full rounded-xl bg-emerald-500 py-3 font-bold text-zinc-950 hover:bg-emerald-400 transition"
-                >
-                  Mulai Ronde Berikutnya ➔
-                </button>
+              {/* NOTIFIKASI KAPEUNCIT */}
+              {roomData?.meta?.lastRoundResult?.kapeuncitPlayerId && (
+                <div className="bg-amber-950/70 border-2 border-amber-500/60 rounded-xl p-3 mb-3 text-xs text-amber-200">
+                  🚨 <strong className="text-amber-400 font-black">KAPEUNCIT!</strong><br />
+                  Skor <strong>{roomData?.meta?.lastRoundResult?.previousLeaderName}</strong> tersusul oleh <strong>{roomData?.meta?.lastRoundResult?.newLeaderName}</strong> sehingga skornya <strong>DI-RESET KEMBALI KE 0!</strong><br />
+                  <span className="text-[11px] text-emerald-300 mt-1 inline-block">
+                    Giliran pertama ronde berikutnya diserahkan kepada {roomData?.meta?.lastRoundResult?.newLeaderName}!
+                  </span>
+                </div>
               )}
+
+              <button
+                onClick={handleStartGame}
+                className="w-full rounded-xl bg-emerald-500 py-3 font-black text-zinc-950 hover:bg-emerald-400 transition shadow-lg"
+              >
+                Mulai Ronde Berikutnya ➔
+              </button>
             </div>
           )}
 
           {/* Area Kartu Pemain Sendiri */}
           <div className="w-full max-w-5xl flex flex-col items-center pb-2 z-10">
-            {roomData?.meta?.status === 'PLAYING' && (
+            {isGamePlaying && (
               <div className="flex items-center gap-3 mb-3 bg-zinc-900/80 px-4 py-2 rounded-2xl border border-white/10 backdrop-blur">
                 <button
                   onClick={handleCheckMeld}
@@ -686,7 +787,7 @@ function RoomContent() {
           </div>
         </main>
 
-        {/* PANEL OBROLAN MEJA (CHAT SIDEBAR TOGGLE) */}
+        {/* PANEL OBROLAN MEJA */}
         {chatOpen && (
           <aside className="w-80 h-full bg-zinc-900 border-l border-white/10 flex flex-col shadow-2xl z-30 animate-in slide-in-from-right duration-200">
             <div className="flex items-center justify-between px-4 py-3 border-b border-zinc-800 bg-zinc-950/50">
@@ -702,7 +803,6 @@ function RoomContent() {
               </button>
             </div>
 
-            {/* Daftar Pesan Chat */}
             <div className="flex-1 overflow-y-auto p-3 space-y-2.5">
               {chatMessages.length === 0 ? (
                 <div className="text-center text-xs text-zinc-600 mt-8">
@@ -733,7 +833,6 @@ function RoomContent() {
               <div ref={chatScrollRef} />
             </div>
 
-            {/* Quick Emote / Chat Cepat */}
             <div className="px-3 py-2 border-t border-zinc-800 flex gap-1.5 overflow-x-auto">
               {['Halo!', 'Awas Umpan! 😂', 'Sakti nih! ⭐', 'GG!'].map((q) => (
                 <button
@@ -746,7 +845,6 @@ function RoomContent() {
               ))}
             </div>
 
-            {/* Input Chat */}
             <form onSubmit={handleSendChat} className="p-3 border-t border-zinc-800 flex gap-2">
               <input
                 type="text"
