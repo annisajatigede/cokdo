@@ -10,13 +10,13 @@ export default function HomePage() {
   const handleJoin = (e: React.FormEvent) => {
     e.preventDefault();
     if (roomIdInput.trim()) {
-      router.push(`/room/${roomIdInput.trim().toUpperCase()}`);
+      router.push(`/room?id=${roomIdInput.trim().toUpperCase()}`);
     }
   };
 
   const handleCreateRoom = () => {
     const randomRoomId = Math.random().toString(36).substring(2, 8).toUpperCase();
-    router.push(`/room/${randomRoomId}`);
+    router.push(`/room?id=${randomRoomId}`);
   };
 
   return (
