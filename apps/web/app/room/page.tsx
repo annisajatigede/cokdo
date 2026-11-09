@@ -36,6 +36,19 @@ function getRankLabel(rank: number): string {
   return rank.toString();
 }
 
+interface DiscardItem {
+  card: Card;
+  discardedBy: string;
+  turnIndex: number;
+  timestamp: number;
+}
+
+interface OpenMeld {
+  type: string;
+  cards: Card[];
+  points: number;
+}
+
 interface ChatMessage {
   id: string;
   senderId: string;
@@ -61,6 +74,12 @@ function RoomContent() {
   const [lastDrawnSource, setLastDrawnSource] = useState<'deck' | 'discard' | null>(null);
   const [copied, setCopied] = useState<boolean>(false);
 
+  // Modal Klasemen Meja
+  const [showLeaderboardModal, setShowLeaderboardModal] = useState<boolean>(false);
+
+  // Modal Tarik Kartu Buangan
+  const [pendingDiscardIndex, setPendingDiscardIndex] = useState<number | null>(null);
+
   // Chat States
   const [chatOpen, setChatOpen] = useState<boolean>(false);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
@@ -68,7 +87,7 @@ function RoomContent() {
   const [unreadChatCount, setUnreadChatCount] = useState<number>(0);
   const chatScrollRef = useRef<HTMLDivElement>(null);
 
-  // 1. Auth Listener & Inisialisasi Meja & Host
+  // 1. Auth Listener & Inisialisasi Meja
   useEffect(() => {
     const savedName = localStorage.getItem('cokdo_player_name');
 
@@ -93,7 +112,7 @@ function RoomContent() {
 
       setCurrentUser(activeUser);
 
-      // Cek apakah meja sudah ada metadatanya. Jika belum, jadikan pemain pertama sebagai Host.
+      // Cek apakah metadata room sudah dibuat
       const roomMetaRef = ref(rtdb, `rooms/${roomId}/meta`);
       const roomMetaSnap = await get(roomMetaRef);
       if (!roomMetaSnap.exists()) {
@@ -107,7 +126,7 @@ function RoomContent() {
         });
       }
 
-      // Daftarkan pemain ke meja
+      // Daftarkan pemain
       const playerRef = ref(rtdb, `rooms/${roomId}/players/${activeUser.uid}`);
       await update(playerRef, {
         name: initialName,
@@ -197,39 +216,40 @@ function RoomContent() {
 
   const playersList = roomData?.players ? Object.entries<any>(roomData.players) : [];
   const playerIds = playersList.map(([id]) => id);
-  const isHost = currentUser && (roomData?.meta?.hostId === currentUser.uid || playerIds[0] === currentUser.uid);
   const currentTurnPlayerId = roomData?.game?.currentTurnPlayerId;
   const isMyTurn = currentUser && currentTurnPlayerId === currentUser.uid;
   const currentTurnPlayer = playersList.find(([id]) => id === currentTurnPlayerId)?.[1];
   const activeWildRank = roomData?.game?.activeWildRank || 2;
   const wildCard = roomData?.game?.wildIndicatorCard;
-  const lastDiscard = roomData?.game?.discardHistory?.lastDiscard;
   const isGamePlaying = roomData?.meta?.status === 'PLAYING';
 
-  // ATURAN GILIRAN PERTAMA (RONDE 1 = HOST, RONDE SELANJUTNYA = SKOR TERTINGGI)
+  // Jejeran buangan kartu lengkap (minimal 7 kartu terakhir tampak di meja)
+  const discardPile: DiscardItem[] = roomData?.game?.discardHistory?.recentDiscards || [];
+  const openMelds: Record<string, OpenMeld[]> = roomData?.game?.openMelds || {};
+
+  // Pemegang skor tertinggi saat ini di meja (Pemenang sementara yang berisiko Kapeuncit)
+  const scores = roomData?.tableLeaderboard?.scores || {};
+  let currentTopPlayerId = playerIds[0];
+  let currentTopScore = -Infinity;
+  playerIds.forEach(id => {
+    const sc = scores[id] ?? 0;
+    if (sc > currentTopScore) {
+      currentTopScore = sc;
+      currentTopPlayerId = id;
+    }
+  });
+
+  // Giliran Pertama: Ronde 1 = Host, Ronde > 1 = Skor Tertinggi
   const determineFirstPlayerId = () => {
     const roundNumber = roomData?.meta?.roundNumber || 1;
     if (roundNumber === 1 || !roomData?.tableLeaderboard?.scores) {
-      // Ronde 1: Pembuat meja (Host) mulai pertama
       return roomData?.meta?.hostId || playerIds[0];
     } else {
-      // Ronde > 1: Pemain dengan skor tertinggi yang mulai pertama!
-      const scores = roomData.tableLeaderboard.scores;
-      let highestScore = -Infinity;
-      let highestPlayerId = playerIds[0];
-
-      playerIds.forEach((id) => {
-        const sc = scores[id] ?? 0;
-        if (sc > highestScore) {
-          highestScore = sc;
-          highestPlayerId = id;
-        }
-      });
-      return highestPlayerId;
+      return currentTopPlayerId || playerIds[0];
     }
   };
 
-  // Aksi: Mulai Permainan (Ronde Baru)
+  // 4. Aksi: Mulai Permainan
   const handleStartGame = async () => {
     if (!playerIds.length) return;
     const deal = dealGame(playerIds);
@@ -243,9 +263,9 @@ function RoomContent() {
       'game/drawDeck': deal.drawDeck,
       'game/drawDeckCount': deal.drawDeck.length,
       'game/hands': deal.playerHands,
+      'game/openMelds': {},
       'game/currentTurnPlayerId': starterId,
       'game/turnDeadline': Date.now() + 30000,
-      'game/discardHistory/lastDiscard': null,
       'game/discardHistory/recentDiscards': []
     };
 
@@ -256,11 +276,12 @@ function RoomContent() {
     await update(ref(rtdb, `rooms/${roomId}`), updates);
     setHasDrawnThisTurn(false);
     setSelectedCardIds([]);
+    setPendingDiscardIndex(null);
 
     handleSendChat(undefined, `🎮 Ronde Dimulai! Kartu Sakti: Rank ${getRankLabel(deal.activeWildRank)}. Giliran pertama: ${starterName}!`);
   };
 
-  // Aksi: Ambil Kartu Dek
+  // 5. Aksi: Ambil Kartu dari Dek Tertutup
   const handleDrawCard = async () => {
     if (!isMyTurn || hasDrawnThisTurn || !roomData?.game?.drawDeck) return;
     const deck = [...roomData.game.drawDeck];
@@ -280,23 +301,65 @@ function RoomContent() {
     setLastDrawnSource('deck');
   };
 
-  // Aksi: Ambil Kartu Buangan
-  const handleDrawFromDiscard = async () => {
-    if (!isMyTurn || hasDrawnThisTurn || !lastDiscard) return;
-    const takenCard = lastDiscard.card;
-    const updatedMyHand = [...myHand, takenCard];
+  // 6. Aksi: Tarik Kartu dari Jejeran Buangan (Deep Pick + Masuk Tangan)
+  const handleExecutePickDiscard = async (discardIndex: number) => {
+    if (!isMyTurn || hasDrawnThisTurn) return;
+    const targetItem = discardPile[discardIndex];
+    if (!targetItem) return;
 
-    await update(ref(rtdb, `rooms/${roomId}`), {
-      'game/discardHistory/lastDiscard': null,
-      [`game/hands/${currentUser?.uid}`]: updatedMyHand,
-      [`players/${currentUser?.uid}/handCount`]: updatedMyHand.length,
-    });
+    // Kartu-kartu di tangan yang dipilih untuk membentuk kombinasi bersama kartu buangan
+    const selectedHandCards = myHand.filter(c => selectedCardIds.includes(c.id));
+    const combinedCards = [...selectedHandCards, targetItem.card];
+
+    // Validasi apakah kartu buangan + kartu di tangan membentuk SERI / KELOMPOK valid
+    const meldValidation = validateMeldWithWildCard(combinedCards, activeWildRank);
+    if (!meldValidation.isValid) {
+      alert(
+        `Kombinasi kartu [${getRankLabel(targetItem.card.rank)}] bersama kartu yang Anda pilih belum valid sebagai Seri/Kelompok! Pilih minimal 2 kartu lain di tangan Anda yang cocok.`
+      );
+      return;
+    }
+
+    // Kartu buangan setelah index ini (kartu sesudahnya) ikut masuk ke tangan!
+    const subsequentCards = discardPile.slice(discardIndex + 1).map(item => item.card);
+
+    // Kartu buangan yang tersisa di jejeran (sebelum index ini)
+    const remainingDiscards = discardPile.slice(0, discardIndex);
+
+    // Sisa kartu di tangan: kurangi kartu yang dipajang di kombinasi, lalu tambahkan kartu-kartu sesudahnya
+    const remainingHandCards = myHand.filter(c => !selectedCardIds.includes(c.id));
+    const finalHand = [...remainingHandCards, ...subsequentCards];
+
+    // Simpan kombinasi terbuka di depan pemain
+    const currentMelds: OpenMeld[] = openMelds[currentUser?.uid || ''] || [];
+    const newMeld: OpenMeld = {
+      type: meldValidation.type || 'SERI',
+      cards: combinedCards,
+      points: meldValidation.calculatedPoints
+    };
+
+    const updates: Record<string, any> = {
+      'game/discardHistory/recentDiscards': remainingDiscards,
+      [`game/hands/${currentUser?.uid}`]: finalHand,
+      [`players/${currentUser?.uid}/handCount`]: finalHand.length,
+      [`game/openMelds/${currentUser?.uid}`]: [...currentMelds, newMeld]
+    };
+
+    await update(ref(rtdb, `rooms/${roomId}`), updates);
 
     setHasDrawnThisTurn(true);
     setLastDrawnSource('discard');
+    setSelectedCardIds([]);
+    setPendingDiscardIndex(null);
+
+    const extraCount = subsequentCards.length;
+    handleSendChat(
+      undefined, 
+      `🂠 ${playerName} menarik kartu [${getRankLabel(targetItem.card.rank)}] untuk kombinasi ${meldValidation.type} di meja! ${extraCount > 0 ? `(${extraCount} kartu buangan sesudahnya ikut masuk ke tangan)` : ''}`
+    );
   };
 
-  // Aksi: Buang Kartu
+  // 7. Aksi: Buang 1 Kartu ke Jejeran Buangan
   const handleDiscard = async () => {
     if (!isMyTurn || !hasDrawnThisTurn || selectedCardIds.length !== 1) return;
     const discardCardId = selectedCardIds[0];
@@ -308,18 +371,15 @@ function RoomContent() {
     const currentIndex = playerIds.indexOf(currentUser?.uid || '');
     const nextPlayerId = playerIds[(currentIndex + 1) % playerIds.length];
 
-    const discardEvent = {
+    const discardEvent: DiscardItem = {
       card: discardCard,
-      discardedBy: currentUser?.uid,
-      turnIndex: (roomData.game.discardHistory?.recentDiscards?.length || 0) + 1,
+      discardedBy: currentUser?.uid || '',
+      turnIndex: discardPile.length + 1,
       timestamp: Date.now()
     };
 
-    const recent = roomData.game.discardHistory?.recentDiscards || [];
-
     await update(ref(rtdb, `rooms/${roomId}`), {
-      'game/discardHistory/lastDiscard': discardEvent,
-      'game/discardHistory/recentDiscards': [...recent, discardEvent],
+      'game/discardHistory/recentDiscards': [...discardPile, discardEvent],
       [`game/hands/${currentUser?.uid}`]: updatedHand,
       [`players/${currentUser?.uid}/handCount`]: updatedHand.length,
       'game/currentTurnPlayerId': nextPlayerId,
@@ -331,7 +391,7 @@ function RoomContent() {
     setLastDrawnSource(null);
   };
 
-  // AKSI: TUTUP / RUMMY & LOGIKA SANKSI UMPAN + KAPEUNCIT
+  // 8. AKSI: TUTUP / RUMMY DENGAN LOGIKA KAPEUNCIT PERSIS
   const handleDeclareWin = async () => {
     if (!isMyTurn || selectedCardIds.length !== 1) {
       alert('Pilih 1 kartu penutup untuk dibuang ke tombol TUTUP!');
@@ -344,61 +404,62 @@ function RoomContent() {
 
     const winnerId = currentUser?.uid || '';
     const bonus = calculateClosingBonus(closingCard, activeWildRank);
-    const scores = { ...(roomData.tableLeaderboard?.scores || {}) };
+    const updatedScores = { ...(roomData.tableLeaderboard?.scores || {}) };
 
     playerIds.forEach(id => {
-      if (scores[id] === undefined) scores[id] = 0;
+      if (updatedScores[id] === undefined) updatedScores[id] = 0;
     });
 
-    // 1. Catat siapa pemegang skor tertinggi sebelum ronde ini selesai
+    // Catat skor tertinggi sebelumnya & siapa pemegangnya
     let previousLeaderId: string | null = null;
     let previousLeaderScore = -Infinity;
     playerIds.forEach(id => {
-      const s = scores[id] || 0;
+      const s = updatedScores[id] || 0;
       if (s > previousLeaderScore) {
         previousLeaderScore = s;
         previousLeaderId = id;
       }
     });
 
-    // 2. Tambah skor pemenang
-    scores[winnerId] = (scores[winnerId] || 0) + bonus;
+    // Pemenang dapat bonus:
+    updatedScores[winnerId] = (updatedScores[winnerId] || 0) + bonus;
 
-    // 3. Sanksi Umpan / Tembak
+    // Sanksi Kena Umpan: jika kartu penutup diambil dari jejeran buangan
     let penalizedPlayerId: string | null = null;
-    if (lastDrawnSource === 'discard' && lastDiscard) {
-      const feederId = lastDiscard.discardedBy;
-      if (feederId && feederId !== winnerId) {
-        penalizedPlayerId = feederId;
-        scores[feederId] = (scores[feederId] || 0) - bonus;
+    if (lastDrawnSource === 'discard' && discardPile.length > 0) {
+      const lastItem = discardPile[discardPile.length - 1];
+      if (lastItem && lastItem.discardedBy !== winnerId) {
+        penalizedPlayerId = lastItem.discardedBy;
+        updatedScores[penalizedPlayerId] = (updatedScores[penalizedPlayerId] || 0) - bonus;
       }
     }
 
     // Pemain pasif
     playerIds.forEach(pid => {
       if (pid !== winnerId && pid !== penalizedPlayerId) {
-        scores[pid] = (scores[pid] || 0) - 25;
+        updatedScores[pid] = (updatedScores[pid] || 0) - 25;
       }
     });
 
-    // 4. LOGIKA KAPEUNCIT:
-    // Cek apakah ada pemain baru yang melampaui rekor skor tertinggi sebelumnya!
+    // LOGIKA KAPEUNCIT:
+    // Cek apakah ada pemain baru yang melampaui previousLeaderScore!
     let kapeuncitPlayerId: string | null = null;
     let newLeaderId = winnerId;
     let newLeaderScore = -Infinity;
 
     playerIds.forEach(id => {
-      const s = scores[id];
+      const s = updatedScores[id];
       if (s > newLeaderScore) {
         newLeaderScore = s;
         newLeaderId = id;
       }
     });
 
-    // Jika pemegang rekor sebelumnya disusul/dilampaui oleh pemain lain:
+    // Jika pemegang angka besar sebelumnya dilampaui pemain lain:
+    // Nilainya langsung jadi 0 dan pendapatan saat putaran itu tidak dihitung (karena 0)!
     if (previousLeaderId && previousLeaderId !== newLeaderId && newLeaderScore > previousLeaderScore) {
       kapeuncitPlayerId = previousLeaderId;
-      scores[previousLeaderId] = 0; // HANGUS / RESET KE 0!
+      updatedScores[previousLeaderId] = 0; // HANGUS JADI 0!
     }
 
     const currentRound = roomData?.meta?.roundNumber || 1;
@@ -408,7 +469,7 @@ function RoomContent() {
     await update(ref(rtdb, `rooms/${roomId}`), {
       'meta/status': 'ROUND_END',
       'meta/roundNumber': currentRound + 1,
-      'tableLeaderboard/scores': scores,
+      'tableLeaderboard/scores': updatedScores,
       'meta/lastRoundResult': {
         winnerId,
         winnerName: playerName,
@@ -422,11 +483,10 @@ function RoomContent() {
       }
     });
 
-    // Siarkan kabar ke obrolan
     if (kapeuncitPlayerId) {
       handleSendChat(
         undefined, 
-        `🚨 KAPEUNCIT! Skor ${previousLeaderName} tersusul oleh ${newLeaderName} (${newLeaderScore}) sehingga di-reset kembali ke 0! Giliran ronde depan diambil oleh ${newLeaderName}.`
+        `🚨 KAPEUNCIT! Skor ${previousLeaderName} tersusul oleh ${newLeaderName} (${newLeaderScore}) sehingga skornya di-reset menjadi 0! Putaran depan dimulai oleh ${newLeaderName}.`
       );
     } else {
       handleSendChat(
@@ -477,14 +537,23 @@ function RoomContent() {
           </span>
         </div>
 
-        {/* Profil Nama & Aksi */}
-        <div className="flex items-center gap-3">
+        {/* Profil Nama, Klasemen Meja, & Aksi */}
+        <div className="flex items-center gap-2.5">
+          {/* Tombol Menu Klasemen Meja */}
+          <button
+            onClick={() => setShowLeaderboardModal(true)}
+            className="flex items-center gap-1.5 bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-300 px-3 py-1.5 rounded-lg text-xs font-bold transition shadow"
+          >
+            <span>🏆</span>
+            <span>Klasemen Meja</span>
+          </button>
+
           <button
             onClick={() => setShowNameModal(true)}
             className="flex items-center gap-1.5 bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 text-zinc-200 px-3 py-1.5 rounded-lg text-xs font-semibold transition"
           >
             <span>👤</span>
-            <span className="max-w-[120px] truncate">{playerName || 'Ganti Nama'}</span>
+            <span className="max-w-[110px] truncate">{playerName || 'Ganti Nama'}</span>
             <span className="text-zinc-500 text-[10px]">✏️</span>
           </button>
 
@@ -495,7 +564,7 @@ function RoomContent() {
             {copied ? '✓ Disalin!' : '📋 Link Meja'}
           </button>
 
-          {/* Tombol Buka Chat Meja */}
+          {/* Tombol Obrolan */}
           <button
             onClick={() => {
               setChatOpen(!chatOpen);
@@ -518,11 +587,11 @@ function RoomContent() {
       <div className="flex-1 relative flex overflow-hidden">
         
         {/* Kolom Meja Kartu */}
-        <main className="flex-1 relative flex flex-col items-center justify-between p-4 bg-radial from-emerald-950/60 via-zinc-950 to-zinc-950">
+        <main className="flex-1 relative flex flex-col items-center justify-between p-3 bg-radial from-emerald-950/60 via-zinc-950 to-zinc-950 overflow-y-auto">
           
-          {/* BANNER GILIRAN JELAS */}
+          {/* BANNER GILIRAN */}
           {isGamePlaying ? (
-            <div className={`px-5 py-2 rounded-full border text-sm font-black tracking-wide flex items-center gap-2 shadow-xl backdrop-blur ${
+            <div className={`px-5 py-1.5 rounded-full border text-xs font-black tracking-wide flex items-center gap-2 shadow-xl backdrop-blur ${
               isMyTurn 
                 ? 'bg-amber-400 text-zinc-950 border-amber-300 ring-4 ring-amber-400/30 animate-pulse' 
                 : 'bg-zinc-900/90 text-zinc-200 border-zinc-700'
@@ -530,69 +599,82 @@ function RoomContent() {
               <span>🔔</span>
               <span>
                 {isMyTurn 
-                  ? 'GILIRAN ANDA! (Ambil lalu Buang 1 Kartu)' 
+                  ? 'GILIRAN ANDA! (Ambil Dek / Tarik Kartu Buangan lalu Buang 1 Kartu)' 
                   : `Sedang Giliran: ${currentTurnPlayer?.name || 'Pemain Lawan'}`}
               </span>
             </div>
           ) : (
-            <div className="px-5 py-1.5 rounded-full border border-zinc-800 bg-zinc-900/70 text-xs text-zinc-400">
+            <div className="px-4 py-1 rounded-full border border-zinc-800 bg-zinc-900/70 text-xs text-zinc-400">
               Meja Siap ({playersList.length} Pemain Bergabung)
             </div>
           )}
 
-          {/* Kursi Lawan (Top Row) */}
-          <div className="w-full max-w-4xl flex items-center justify-around px-4 pt-1">
+          {/* Kursi 3 Lawan & Kombinasi Terbuka di Meja Mereka */}
+          <div className="w-full max-w-5xl flex items-start justify-around px-4">
             {playersList.filter(([id]) => id !== currentUser?.uid).map(([id, p]) => {
               const isHisTurn = currentTurnPlayerId === id;
               const sc = roomData?.tableLeaderboard?.scores?.[id] || 0;
+              const playerMelds = openMelds[id] || [];
+
               return (
-                <div 
-                  key={id} 
-                  className={`flex flex-col items-center p-3 rounded-2xl border transition-all duration-200 ${
+                <div key={id} className="flex flex-col items-center gap-1">
+                  <div className={`flex flex-col items-center p-2.5 rounded-2xl border transition-all duration-200 ${
                     isHisTurn && isGamePlaying
                       ? 'bg-amber-500/25 border-amber-400 ring-4 ring-amber-400/40 scale-105 shadow-xl' 
                       : 'bg-zinc-900/60 border-zinc-800'
-                  }`}
-                >
-                  <div className="w-11 h-11 rounded-full bg-emerald-600/30 border border-emerald-500/50 flex items-center justify-center font-bold text-base text-emerald-300 shadow">
-                    {p.name?.substring(0, 2).toUpperCase()}
-                  </div>
-                  <span className="text-xs font-bold mt-1 max-w-[100px] truncate text-white">
-                    {p.name}
-                  </span>
-                  <span className="text-[10px] text-zinc-400 font-mono">
-                    {isGamePlaying ? `🂠 ${p.handCount || 7} Kartu` : 'Siap'}
-                  </span>
-                  <span className={`text-[10px] font-black font-mono ${
-                    sc < 0 ? 'text-rose-400' : 'text-emerald-400'
                   }`}>
-                    Skor: {sc}
-                  </span>
+                    <div className="w-9 h-9 rounded-full bg-emerald-600/30 border border-emerald-500/50 flex items-center justify-center font-bold text-sm text-emerald-300 shadow">
+                      {p.name?.substring(0, 2).toUpperCase()}
+                    </div>
+                    <span className="text-xs font-bold mt-1 max-w-[90px] truncate text-white">{p.name}</span>
+                    <span className="text-[10px] text-zinc-400 font-mono">
+                      {isGamePlaying ? `🂠 ${p.handCount || 7} Kartu` : 'Siap'}
+                    </span>
+                    <span className={`text-[10px] font-black font-mono ${sc < 0 ? 'text-rose-400' : 'text-emerald-400'}`}>
+                      Skor: {sc}
+                    </span>
+                  </div>
+
+                  {/* Kombinasi Terbuka Lawan di Meja */}
+                  {playerMelds.length > 0 && (
+                    <div className="flex gap-1 bg-black/40 p-1 rounded-lg border border-white/5 max-w-[130px] overflow-x-auto">
+                      {playerMelds.map((m, mIdx) => (
+                        <div key={mIdx} className="flex -space-x-2">
+                          {m.cards.map(c => (
+                            <div key={c.id} className="w-5 h-7 bg-white rounded text-[8px] font-bold text-zinc-950 flex flex-col items-center justify-center border border-zinc-400">
+                              <span>{getRankLabel(c.rank)}</span>
+                              <span className={getSuitSymbol(c.suit).color}>{getSuitSymbol(c.suit).symbol}</span>
+                            </div>
+                          ))}
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               );
             })}
           </div>
 
-          {/* Tengah Meja: Kartu Sakti & Tumpukan Kartu */}
-          <div className="relative flex items-center justify-center gap-8 p-6 rounded-3xl bg-emerald-950/40 border-2 border-emerald-600/30 shadow-2xl backdrop-blur-md">
+          {/* TENGAH MEJA: KARTU SAKTI & DEK AMBILAN */}
+          <div className="flex items-center justify-center gap-6 p-4 rounded-2xl bg-emerald-950/40 border border-emerald-600/30 shadow-xl backdrop-blur-md my-1">
             
             {/* Kartu Sakti Terbuka */}
             <div className="flex flex-col items-center">
-              <span className="text-[11px] font-black uppercase tracking-wider text-amber-400 mb-1 flex items-center gap-1">
+              <span className="text-[10px] font-black uppercase tracking-wider text-amber-400 mb-1 flex items-center gap-1">
                 ⭐ KARTU SAKTI ⭐
               </span>
               {wildCard ? (
-                <div className="relative w-18 h-26 rounded-xl bg-white text-zinc-950 font-bold flex flex-col items-center justify-between p-2 border-3 border-amber-400 shadow-xl shadow-amber-500/20">
-                  <span className="text-sm font-black self-start">{getRankLabel(wildCard.rank)}</span>
-                  <span className={`text-2xl ${getSuitSymbol(wildCard.suit).color}`}>
+                <div className="relative w-14 h-20 rounded-lg bg-white text-zinc-950 font-bold flex flex-col items-center justify-between p-1.5 border-2 border-amber-400 shadow-md">
+                  <span className="text-xs font-black self-start">{getRankLabel(wildCard.rank)}</span>
+                  <span className={`text-xl ${getSuitSymbol(wildCard.suit).color}`}>
                     {getSuitSymbol(wildCard.suit).symbol}
                   </span>
-                  <span className="text-[9px] bg-amber-400 text-zinc-950 px-1 rounded font-black">
+                  <span className="text-[8px] bg-amber-400 text-zinc-950 px-1 rounded font-black">
                     SEMUA {getRankLabel(wildCard.rank)}
                   </span>
                 </div>
               ) : (
-                <div className="w-18 h-26 rounded-xl bg-zinc-900 border border-zinc-800 flex items-center justify-center text-xs text-zinc-600">
+                <div className="w-14 h-20 rounded-lg bg-zinc-900 border border-zinc-800 flex items-center justify-center text-[10px] text-zinc-600">
                   Tertutup
                 </div>
               )}
@@ -600,68 +682,126 @@ function RoomContent() {
 
             {/* Dek Ambil */}
             <div className="flex flex-col items-center">
-              <span className="text-[11px] font-semibold text-zinc-400 mb-1">
+              <span className="text-[10px] font-semibold text-zinc-400 mb-1">
                 Dek ({roomData?.game?.drawDeckCount || 52})
               </span>
               <button
                 onClick={handleDrawCard}
                 disabled={!isMyTurn || hasDrawnThisTurn || !isGamePlaying}
-                className={`w-18 h-26 rounded-xl border-2 flex flex-col items-center justify-center font-bold text-xs transition ${
+                className={`w-14 h-20 rounded-lg border-2 flex flex-col items-center justify-center font-bold text-xs transition ${
                   isMyTurn && !hasDrawnThisTurn && isGamePlaying
-                    ? 'bg-emerald-600 hover:bg-emerald-500 border-white text-white shadow-lg shadow-emerald-500/40 cursor-pointer active:scale-95'
+                    ? 'bg-emerald-600 hover:bg-emerald-500 border-white text-white shadow-lg cursor-pointer active:scale-95'
                     : 'bg-zinc-800 border-zinc-700 text-zinc-500 cursor-not-allowed opacity-60'
                 }`}
               >
-                <span>AMBIL</span>
-                <span className="text-lg">🂠</span>
+                <span className="text-[10px]">AMBIL</span>
+                <span className="text-base">🂠</span>
               </button>
-            </div>
-
-            {/* Buangan Terakhir */}
-            <div className="flex flex-col items-center">
-              <span className="text-[11px] font-semibold text-zinc-400 mb-1">
-                Buangan Terakhir
-              </span>
-              {lastDiscard ? (
-                <div 
-                  onClick={handleDrawFromDiscard}
-                  className={`w-18 h-26 rounded-xl bg-white text-zinc-950 font-bold flex flex-col items-center justify-between p-2 border-2 transition ${
-                    isMyTurn && !hasDrawnThisTurn
-                      ? 'border-emerald-400 cursor-pointer ring-2 ring-emerald-400 shadow-lg hover:scale-105'
-                      : 'border-zinc-300 opacity-90'
-                  }`}
-                >
-                  <span className="text-sm font-black self-start">{getRankLabel(lastDiscard.card.rank)}</span>
-                  <span className={`text-2xl ${getSuitSymbol(lastDiscard.card.suit).color}`}>
-                    {getSuitSymbol(lastDiscard.card.suit).symbol}
-                  </span>
-                  <span className="text-[9px] text-zinc-500 truncate w-full text-center">
-                    dari {roomData?.players?.[lastDiscard.discardedBy]?.name?.substring(0, 8) || 'Lawan'}
-                  </span>
-                </div>
-              ) : (
-                <div className="w-18 h-26 rounded-xl bg-zinc-900 border border-dashed border-zinc-700 flex items-center justify-center text-[10px] text-zinc-500">
-                  Kosong
-                </div>
-              )}
             </div>
           </div>
 
-          {/* KOTAK STATUS & TOMBOL MULAI PERMAINAN (SELALU MUNCUL SAAT PERMAINAN BELUM BERJALAN) */}
+          {/* JEJERAN KARTU BUANGAN (MINIMAL 7 KARTU TERAKHIR BERJEJER) */}
+          <div className="w-full max-w-4xl flex flex-col items-center bg-black/40 border border-white/10 rounded-2xl p-3 my-1">
+            <div className="flex items-center justify-between w-full px-2 mb-1.5">
+              <span className="text-xs font-bold text-zinc-300 flex items-center gap-1.5">
+                <span>🂠</span>
+                <span>Jejeran Kartu Buangan ({discardPile.length})</span>
+                <span className="text-[10px] text-zinc-500 font-normal">
+                  (Klik salah satu kartu untuk ditarik membentuk Seri/Kelompok)
+                </span>
+              </span>
+              <span className="text-[10px] text-amber-400 font-mono">
+                {isMyTurn && !hasDrawnThisTurn ? '👉 Klik kartu untuk menariknya!' : ''}
+              </span>
+            </div>
+
+            {/* Strip Horisontal Kartu Buangan Berjejer */}
+            <div className="flex items-center gap-2 overflow-x-auto w-full py-1 px-1 scrollbar-thin">
+              {discardPile.length === 0 ? (
+                <div className="w-full text-center py-4 text-xs text-zinc-600 border border-dashed border-zinc-800 rounded-xl">
+                  Belum ada kartu buangan di meja.
+                </div>
+              ) : (
+                discardPile.slice(-12).map((item, relIndex, arr) => {
+                  const actualIndex = discardPile.length - arr.length + relIndex;
+                  const isWild = item.card.rank === activeWildRank;
+                  const { symbol, color } = getSuitSymbol(item.card.suit);
+                  const isPending = pendingDiscardIndex === actualIndex;
+
+                  return (
+                    <div
+                      key={`${item.card.id}-${actualIndex}`}
+                      onClick={() => {
+                        if (isMyTurn && !hasDrawnThisTurn) {
+                          setPendingDiscardIndex(actualIndex);
+                        }
+                      }}
+                      className={`relative flex-shrink-0 w-13 h-19 rounded-lg bg-white text-zinc-950 font-bold flex flex-col justify-between p-1.5 select-none transition-all ${
+                        isMyTurn && !hasDrawnThisTurn 
+                          ? 'cursor-pointer hover:-translate-y-2 hover:ring-2 hover:ring-emerald-400 shadow-md' 
+                          : 'opacity-90'
+                      } ${isPending ? '-translate-y-3 ring-4 ring-amber-400 shadow-2xl' : 'border border-zinc-300'}`}
+                    >
+                      <span className="text-[10px] font-black self-start">{getRankLabel(item.card.rank)}</span>
+                      <span className={`text-lg self-center ${color}`}>{symbol}</span>
+                      <span className="text-[8px] text-zinc-500 truncate w-full text-center">
+                        {roomData?.players?.[item.discardedBy]?.name?.substring(0, 5) || 'Lawan'}
+                      </span>
+
+                      {isWild && (
+                        <span className="absolute -top-1.5 left-1/2 -translate-x-1/2 bg-amber-400 text-zinc-950 text-[7px] font-black px-1 rounded-full uppercase">
+                          SAKTI
+                        </span>
+                      )}
+                    </div>
+                  );
+                })
+              )}
+            </div>
+
+            {/* Bar Aksi Tarik Kartu Buangan Jika Ada yang Dipilih */}
+            {pendingDiscardIndex !== null && discardPile[pendingDiscardIndex] && (
+              <div className="mt-2.5 w-full bg-emerald-950/80 border border-emerald-500/50 rounded-xl p-2.5 flex items-center justify-between text-xs animate-in fade-in">
+                <div className="flex items-center gap-2">
+                  <span>Tarik kartu</span>
+                  <span className="font-bold text-amber-400 font-mono">
+                    [{getRankLabel(discardPile[pendingDiscardIndex].card.rank)}{getSuitSymbol(discardPile[pendingDiscardIndex].card.suit).symbol}]
+                  </span>
+                  <span className="text-zinc-300">
+                    bersama {selectedCardIds.length} kartu pilihan di tangan untuk digelar di meja:
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => handleExecutePickDiscard(pendingDiscardIndex)}
+                    className="rounded-lg bg-emerald-500 hover:bg-emerald-400 text-zinc-950 px-3 py-1 font-black shadow"
+                  >
+                    ✓ Buka Kombinasi & Tarik Kartu
+                  </button>
+                  <button
+                    onClick={() => setPendingDiscardIndex(null)}
+                    className="rounded-lg bg-zinc-800 text-zinc-400 hover:text-white px-2 py-1"
+                  >
+                    Batal
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* KOTAK STATUS & TOMBOL MULAI PERMAINAN */}
           {!isGamePlaying && roomData?.meta?.status !== 'ROUND_END' && (
-            <div className="bg-zinc-900/95 border-2 border-emerald-500/40 rounded-2xl p-6 text-center max-w-md shadow-2xl backdrop-blur">
-              <h3 className="text-lg font-black text-white mb-1">Ruang Tunggu Meja</h3>
-              <p className="text-xs text-zinc-400 mb-4">
+            <div className="bg-zinc-900/95 border-2 border-emerald-500/40 rounded-2xl p-5 text-center max-w-md shadow-2xl backdrop-blur my-2">
+              <h3 className="text-base font-black text-white mb-1">Ruang Tunggu Meja</h3>
+              <p className="text-xs text-zinc-400 mb-3">
                 {playersList.length < 2 
                   ? 'Ajak teman masuk meja (minimal 2 pemain, maksimal 4).' 
                   : `${playersList.length} pemain sudah kumpul di meja!`}
               </p>
-
-              {/* Siapapun atau Host bisa klik mulai jika pemain >= 2 */}
               <button
                 onClick={handleStartGame}
                 disabled={playersList.length < 2}
-                className="w-full rounded-xl bg-emerald-500 py-3.5 font-black text-zinc-950 hover:bg-emerald-400 active:scale-95 transition shadow-lg shadow-emerald-500/30 disabled:opacity-50"
+                className="w-full rounded-xl bg-emerald-500 py-3 font-black text-zinc-950 hover:bg-emerald-400 active:scale-95 transition shadow-lg shadow-emerald-500/30 disabled:opacity-50"
               >
                 🎮 Mulai Permainan Sekarang!
               </button>
@@ -670,50 +810,69 @@ function RoomContent() {
 
           {/* Modal Ronde Selesai & Pengumuman Kapeuncit */}
           {roomData?.meta?.status === 'ROUND_END' && (
-            <div className="bg-zinc-900/95 border-2 border-amber-400 rounded-2xl p-6 text-center max-w-lg shadow-2xl backdrop-blur z-30">
-              <h2 className="text-2xl font-black text-amber-400 mb-1">🎉 RONDE SELESAI! 🎉</h2>
-              <p className="text-sm text-zinc-200 font-semibold mb-2">
+            <div className="bg-zinc-900/95 border-2 border-amber-400 rounded-2xl p-5 text-center max-w-lg shadow-2xl backdrop-blur z-30 my-2">
+              <h2 className="text-xl font-black text-amber-400 mb-1">🎉 RONDE SELESAI! 🎉</h2>
+              <p className="text-xs text-zinc-200 font-semibold mb-2">
                 Pemenang: <span className="text-emerald-400">{roomData?.meta?.lastRoundResult?.winnerName}</span> 
                 {' '}(+{roomData?.meta?.lastRoundResult?.bonus} Poin)
               </p>
               
-              {/* Notifikasi Kena Umpan */}
               {roomData?.meta?.lastRoundResult?.wasFromDiscard && (
-                <div className="bg-red-950/60 border border-red-500/40 rounded-xl p-2.5 mb-3 text-xs text-red-200">
+                <div className="bg-red-950/60 border border-red-500/40 rounded-xl p-2 mb-2 text-xs text-red-200">
                   ⚠️ <strong className="text-red-400">SANKSI KENA UMPAN AKTIF!</strong><br />
                   {roomData?.players?.[roomData?.meta?.lastRoundResult?.penalizedPlayerId]?.name || 'Pengumpan'}{' '}
                   dipotong -{roomData?.meta?.lastRoundResult?.bonus} Poin karena memberi umpan kartu penutup!
                 </div>
               )}
 
-              {/* NOTIFIKASI KAPEUNCIT */}
               {roomData?.meta?.lastRoundResult?.kapeuncitPlayerId && (
-                <div className="bg-amber-950/70 border-2 border-amber-500/60 rounded-xl p-3 mb-3 text-xs text-amber-200">
+                <div className="bg-amber-950/70 border-2 border-amber-500/60 rounded-xl p-2.5 mb-2.5 text-xs text-amber-200">
                   🚨 <strong className="text-amber-400 font-black">KAPEUNCIT!</strong><br />
-                  Skor <strong>{roomData?.meta?.lastRoundResult?.previousLeaderName}</strong> tersusul oleh <strong>{roomData?.meta?.lastRoundResult?.newLeaderName}</strong> sehingga skornya <strong>DI-RESET KEMBALI KE 0!</strong><br />
-                  <span className="text-[11px] text-emerald-300 mt-1 inline-block">
-                    Giliran pertama ronde berikutnya diserahkan kepada {roomData?.meta?.lastRoundResult?.newLeaderName}!
+                  Skor <strong>{roomData?.meta?.lastRoundResult?.previousLeaderName}</strong> tersusul oleh <strong>{roomData?.meta?.lastRoundResult?.newLeaderName}</strong> sehingga skornya <strong>DI-RESET JADI 0!</strong><br />
+                  <span className="text-[10px] text-emerald-300 mt-1 inline-block">
+                    Putaran berikutnya otomatis dimulai oleh {roomData?.meta?.lastRoundResult?.newLeaderName}!
                   </span>
                 </div>
               )}
 
               <button
                 onClick={handleStartGame}
-                className="w-full rounded-xl bg-emerald-500 py-3 font-black text-zinc-950 hover:bg-emerald-400 transition shadow-lg"
+                className="w-full rounded-xl bg-emerald-500 py-2.5 font-black text-zinc-950 hover:bg-emerald-400 transition shadow-lg"
               >
                 Mulai Ronde Berikutnya ➔
               </button>
             </div>
           )}
 
-          {/* Area Kartu Pemain Sendiri */}
-          <div className="w-full max-w-5xl flex flex-col items-center pb-2 z-10">
+          {/* AREA KOMBINASI TERBUKA & KARTU TANGAN PEMAIN SENDIRI */}
+          <div className="w-full max-w-5xl flex flex-col items-center z-10 pt-1">
+            
+            {/* Kombinasi yang Sudah Terbuka di Depan Pemain Sendiri */}
+            {openMelds[currentUser?.uid || ''] && openMelds[currentUser?.uid || ''].length > 0 && (
+              <div className="flex items-center gap-2 mb-2 bg-emerald-950/50 border border-emerald-500/30 px-3 py-1.5 rounded-xl">
+                <span className="text-[10px] uppercase font-bold text-emerald-400">Kombinasi Terbuka Anda:</span>
+                <div className="flex gap-2">
+                  {openMelds[currentUser?.uid || ''].map((m, mIdx) => (
+                    <div key={mIdx} className="flex -space-x-2">
+                      {m.cards.map(c => (
+                        <div key={c.id} className="w-7 h-10 bg-white rounded text-[10px] font-bold text-zinc-950 flex flex-col items-center justify-center border border-zinc-400 shadow">
+                          <span>{getRankLabel(c.rank)}</span>
+                          <span className={getSuitSymbol(c.suit).color}>{getSuitSymbol(c.suit).symbol}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Action Bar Pemain */}
             {isGamePlaying && (
-              <div className="flex items-center gap-3 mb-3 bg-zinc-900/80 px-4 py-2 rounded-2xl border border-white/10 backdrop-blur">
+              <div className="flex items-center gap-3 mb-2 bg-zinc-900/80 px-4 py-1.5 rounded-2xl border border-white/10 backdrop-blur">
                 <button
                   onClick={handleCheckMeld}
                   disabled={selectedCardIds.length < 3}
-                  className="rounded-lg bg-zinc-800 hover:bg-zinc-700 disabled:opacity-40 text-xs px-3 py-1.5 font-semibold text-zinc-200 border border-zinc-700"
+                  className="rounded-lg bg-zinc-800 hover:bg-zinc-700 disabled:opacity-40 text-xs px-3 py-1 font-semibold text-zinc-200 border border-zinc-700"
                 >
                   🔍 Cek Seri / Kelompok
                 </button>
@@ -721,15 +880,15 @@ function RoomContent() {
                 <button
                   onClick={handleDiscard}
                   disabled={!isMyTurn || !hasDrawnThisTurn || selectedCardIds.length !== 1}
-                  className="rounded-lg bg-rose-600 hover:bg-rose-500 disabled:opacity-40 text-xs px-4 py-1.5 font-bold text-white shadow"
+                  className="rounded-lg bg-rose-600 hover:bg-rose-500 disabled:opacity-40 text-xs px-4 py-1 font-bold text-white shadow"
                 >
-                  🗑️ Buang Kartu
+                  🗑️ Buang 1 Kartu
                 </button>
 
                 <button
                   onClick={handleDeclareWin}
                   disabled={!isMyTurn || selectedCardIds.length !== 1}
-                  className="rounded-lg bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-xs px-4 py-1.5 font-black text-zinc-950 shadow-lg shadow-amber-500/20"
+                  className="rounded-lg bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-xs px-4 py-1 font-black text-zinc-950 shadow-lg shadow-amber-500/20"
                 >
                   🏆 TUTUP / RUMMY!
                 </button>
@@ -737,13 +896,13 @@ function RoomContent() {
             )}
 
             {meldMessage && (
-              <div className="text-xs bg-zinc-900 text-emerald-300 px-3 py-1 rounded-full mb-2 border border-emerald-500/30">
+              <div className="text-xs bg-zinc-900 text-emerald-300 px-3 py-0.5 rounded-full mb-1 border border-emerald-500/30">
                 {meldMessage}
               </div>
             )}
 
-            {/* Kartu di Tangan */}
-            <div className="flex items-center justify-center gap-2 flex-wrap px-4 min-h-[120px]">
+            {/* Kartu di Tangan (Bisa lebih atau kurang dari 7 kartu) */}
+            <div className="flex items-center justify-center gap-1.5 flex-wrap px-4 min-h-[110px]">
               {myHand.map((card) => {
                 const isSelected = selectedCardIds.includes(card.id);
                 const isWild = card.rank === activeWildRank;
@@ -753,14 +912,14 @@ function RoomContent() {
                   <div
                     key={card.id}
                     onClick={() => toggleSelectCard(card.id)}
-                    className={`relative w-16 h-24 rounded-xl bg-white text-zinc-950 font-bold flex flex-col justify-between p-2 cursor-pointer transition-all duration-150 select-none ${
+                    className={`relative w-15 h-22 rounded-xl bg-white text-zinc-950 font-bold flex flex-col justify-between p-2 cursor-pointer transition-all duration-150 select-none ${
                       isSelected 
                         ? '-translate-y-4 ring-4 ring-amber-400 shadow-2xl scale-105' 
                         : 'hover:-translate-y-2 shadow-md'
                     } ${isWild ? 'border-2 border-amber-400 ring-1 ring-amber-300' : 'border border-zinc-300'}`}
                   >
                     <span className="text-xs font-black self-start">{getRankLabel(card.rank)}</span>
-                    <span className={`text-2xl self-center ${color}`}>{symbol}</span>
+                    <span className={`text-xl self-center ${color}`}>{symbol}</span>
                     <span className="text-xs font-black self-end">{getRankLabel(card.rank)}</span>
 
                     {isWild && (
@@ -773,15 +932,15 @@ function RoomContent() {
               })}
             </div>
 
-            <div className="text-[11px] text-zinc-400 mt-2 font-mono flex items-center gap-2">
-              <span className="font-bold text-white">{playerName}</span> | 
+            <div className="text-[11px] text-zinc-400 mt-1 font-mono flex items-center gap-2">
+              <span className="font-bold text-white">{playerName}</span> ({myHand.length} kartu di tangan) | 
               <span>Skor Meja: </span>
               <strong className={
-                (roomData?.tableLeaderboard?.scores?.[currentUser?.uid || ''] || 0) < 0 
+                (scores[currentUser?.uid || ''] || 0) < 0 
                   ? 'text-rose-400' 
                   : 'text-emerald-400'
               }>
-                {roomData?.tableLeaderboard?.scores?.[currentUser?.uid || ''] || 0}
+                {scores[currentUser?.uid || ''] || 0}
               </strong>
             </div>
           </div>
@@ -834,7 +993,7 @@ function RoomContent() {
             </div>
 
             <div className="px-3 py-2 border-t border-zinc-800 flex gap-1.5 overflow-x-auto">
-              {['Halo!', 'Awas Umpan! 😂', 'Sakti nih! ⭐', 'GG!'].map((q) => (
+              {['Halo!', 'Awas Umpan! 😂', 'Sakti nih! ⭐', 'Kapeuncit lu! 🤣', 'GG!'].map((q) => (
                 <button
                   key={q}
                   onClick={() => handleSendChat(undefined, q)}
@@ -864,6 +1023,81 @@ function RoomContent() {
         )}
 
       </div>
+
+      {/* MODAL KLASEMEN MEJA */}
+      {showLeaderboardModal && (
+        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="w-full max-w-md rounded-2xl border border-zinc-700 bg-zinc-900 p-6 shadow-2xl">
+            <div className="flex items-center justify-between mb-4 border-b border-zinc-800 pb-3">
+              <div className="flex items-center gap-2">
+                <span className="text-xl">🏆</span>
+                <h3 className="text-base font-black text-white">Klasemen Meja Permainan</h3>
+              </div>
+              <button
+                onClick={() => setShowLeaderboardModal(false)}
+                className="text-zinc-400 hover:text-white text-xs px-2.5 py-1 rounded bg-zinc-800"
+              >
+                ✕
+              </button>
+            </div>
+
+            <p className="text-xs text-zinc-400 mb-4">
+              Peringkat skor terkini 4 pemain di meja ini (Ronde {roomData?.meta?.roundNumber || 1}):
+            </p>
+
+            <div className="space-y-2 mb-6">
+              {[...playersList]
+                .sort((a, b) => (scores[b[0]] || 0) - (scores[a[0]] || 0))
+                .map(([pid, p], index) => {
+                  const sc = scores[pid] || 0;
+                  const isTop = index === 0;
+                  return (
+                    <div 
+                      key={pid} 
+                      className={`flex items-center justify-between p-3 rounded-xl border ${
+                        isTop 
+                          ? 'bg-amber-500/10 border-amber-500/40 ring-1 ring-amber-500/30' 
+                          : 'bg-zinc-950 border-zinc-800'
+                      }`}
+                    >
+                      <div className="flex items-center gap-3">
+                        <span className={`w-6 text-center font-black font-mono text-sm ${
+                          index === 0 ? 'text-amber-400' : index === 1 ? 'text-zinc-300' : 'text-zinc-500'
+                        }`}>
+                          {index === 0 ? '👑' : `#${index + 1}`}
+                        </span>
+                        <div>
+                          <div className="text-xs font-bold text-white flex items-center gap-1.5">
+                            <span>{p.name}</span>
+                            {pid === currentUser?.uid && (
+                              <span className="text-[9px] bg-emerald-500/20 text-emerald-300 px-1 rounded">Anda</span>
+                            )}
+                          </div>
+                          <div className="text-[10px] text-zinc-500 font-mono">
+                            {p.isGuest ? 'Akun Tamu' : 'Pemain Resmi'}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className={`font-mono font-black text-sm ${
+                        sc < 0 ? 'text-rose-400' : sc === 0 ? 'text-zinc-400' : 'text-emerald-400'
+                      }`}>
+                        {sc > 0 ? `+${sc}` : sc} Poin
+                      </div>
+                    </div>
+                  );
+                })}
+            </div>
+
+            <button
+              onClick={() => setShowLeaderboardModal(false)}
+              className="w-full rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-200 py-2.5 text-xs font-bold transition"
+            >
+              Tutup Klasemen
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* MODAL GANTI NAMA PEMAIN */}
       {showNameModal && (
